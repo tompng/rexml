@@ -983,6 +983,55 @@ module REXMLTests
       assert_equal(%w[b c d], REXML::XPath.match(doc, '//d[@id="2"]/preceding-sibling::*').map(&:name))
     end
 
+    def test_step_optimize
+      size = 1000
+      nodes = [[true]] * 40 + [[false]] * (size - 40)
+      while nodes.size != 1
+        n = [rand(1..10), nodes.size].min
+        n.times {
+          i = rand(nodes.size - n)
+          nodes[nodes.size - n], nodes[i] = nodes[i], nodes[nodes.size - n]
+        }
+        size += 1
+        children = nodes.pop(n)
+        is_anchor = nodes.size <= 4 ? false : nodes.size < 200 ? rand < 0.25 : rand < 0.1
+        nodes << [is_anchor, *children]
+      end
+      id = 0
+      create_xml = -> (node) {
+        id += 1
+        attributes = "id='#{id}'"
+        anchor, *children = node
+        attributes << ' anchor="true"' if anchor
+        open = "<div #{attributes}>"
+        body = children.empty? ? '' : children.map(&create_xml).join
+        close = "</div>"
+        "#{open}#{body}#{close}"
+      }
+      doc = REXML::Document.new(create_xml.call(nodes.first))
+      xpath_base = "//div[@anchor='true']"
+      test = '[number(@id) mod 5 < 3]'
+      disable_opt = '[position() * 1 > 0]'
+      axises = %w[descendant descendant-or-self following following-sibling parent ancestor ancestor-or-self preceding preceding-sibling]
+
+      position_queries = [3, 10, 50].flat_map do |pos|
+        ["[position()=#{pos}]", "[position()<#{pos}]", "[position()>#{pos}]"]
+      end
+      axises.each do |axis|
+        ['', *position_queries].each do |position_query|
+          t=Time.now
+          res1 = REXML::XPath.match(doc, "#{xpath_base}/#{axis}::*#{test}#{position_query}#{disable_opt}")
+          p Time.now-t;t=Time.now
+          res2 = REXML::XPath.match(doc, "#{xpath_base}/#{axis}::*#{test}#{position_query}")
+          p Time.now-t
+          expected = res1.map {|e| e.attributes['id']}
+          actual = res2.map {|e| e.attributes['id']}
+          p [axis, position_query, expected.size]
+          assert_equal(expected, actual)
+        end
+      end
+    end
+
     def test_descendant_or_self_ordering
       source = "<a>
       <b>

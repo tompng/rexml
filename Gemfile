@@ -18,3 +18,4 @@ group :test do
   gem "test-unit"
   gem "test-unit-ruby-core"
 end
+gem'irb'
