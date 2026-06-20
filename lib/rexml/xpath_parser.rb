@@ -511,7 +511,27 @@ module REXML
           end
           matched
         end
-      else # Slow path for :nodesets, :reverse_index_eq, :reverse_index_lt, :reverse_index_gt
+      when :reverse_index_eq, :reverse_index_lt, :reverse_index_gt
+        nodeset.group_by(&:parent).flat_map do |parent, sibling_nodes|
+          anchors = Set.new.compare_by_identity
+          sibling_nodes.each {|sibling| anchors << sibling }
+          children = parent.children
+          children = children.reverse if reverse
+
+          # Different anchor node gives the same reverse-index. We only need to check with the first anchor
+          followings = children.drop_while {|child| !anchors.include?(child) }.drop(1)
+          candidates = followings.select(&tester).reverse
+          case operator
+          when :reverse_index_eq
+            matched = candidates[value] if value >= 0
+            matched ? [matched] : []
+          when :reverse_index_lt
+            value >= 0 ? candidates[0...value] : []
+          when :reverse_index_gt
+            value >= 0 ? candidates.drop(value + 1) : candidates
+          end
+        end
+      when :nodesets
         nodesets = nodeset.map do |node|
           parent = node.parent
           index = parent.children.index(node)
