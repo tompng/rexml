@@ -516,8 +516,8 @@ module REXML
             parent = parent.parent
           end
         end
-        ancestors.select(&tester)
-      else
+        return ancestors.select(&tester)
+      when :nodesets
         # Slow path
         nodesets = nodeset.map do |node|
           ancestors = []
@@ -529,8 +529,77 @@ module REXML
           end
           ancestors
         end
-        non_optimized_nodesets_select(nodesets, tester, selector)
+        return non_optimized_nodesets_select(nodesets, tester, selector)
       end
+
+      operator, value = selector
+      depths = {}.compare_by_identity
+      matched_parents = {}.compare_by_identity
+      test_matched = Set.new.compare_by_identity
+      nodeset.each do |node|
+        next if depths[node]
+        ancestors = [node]
+
+        while node.parent && !depths.key?(node.parent)
+          node = node.parent
+          ancestors << node
+        end
+        matched = test_matched.include?(node.parent) ? node.parent : matched_parents[node.parent]
+        depth = depths[matched] || 0
+        ancestors.reverse_each do |n|
+          matched_parents[n] = matched
+          if tester.call(n)
+            test_matched << n
+            depth += 1
+            matched = n
+          end
+          depths[n] = depth
+        end
+      end
+      node_depths = {}.compare_by_identity
+      depth_nodes = {}
+      nodeset.each do |anchor|
+        leaf = include_self && test_matched.include?(anchor) ? anchor : matched_parents[anchor]
+        next unless leaf
+        d = depths[leaf]
+        node_depths[leaf] ||= [d, d, Set[d]]
+        (depth_nodes[d] ||= Set.new.compare_by_identity) << leaf
+      end
+      current_depth = depth_nodes.keys.max
+      result = []
+      while current_depth >= 0
+        depth_nodes[current_depth]&.group_by {|n| matched_parents[n] }&.each do |parent, nodes|
+          (depth_nodes[current_depth - 1] ||= Set.new.compare_by_identity) << parent if parent
+          nodes.each do |node|
+            min, max, depths = node_depths[node]
+            case operator
+            when :index_eq
+              result << node if depths.include?(current_depth + value)
+            when :index_lt
+              result << node if min < current_depth + value
+            when :index_gt
+              result << node if max > current_depth + value
+            when :reverse_index_eq
+              result << node if current_depth == value
+            when :reverse_index_lt
+              result << node if current_depth < value
+            when :reverse_index_gt
+              result << node if current_depth > value
+            end
+          end
+          merge_nodes = nodes.dup
+          merge_nodes << parent if parent && node_depths[parent]
+          min = merge_nodes.map {|n| node_depths[n][0] }.min
+          max = merge_nodes.map {|n| node_depths[n][1] }.max
+          *sets, largest_set = merge_nodes.map {|n| node_depths[n][2] }.sort_by(&:size)
+          sets.each do |depths|
+            depths.each {|d| largest_set << d }
+          end
+          node_depths[parent] = [min, max, largest_set] if parent
+        end
+        current_depth -= 1
+      end
+      result
     end
 
     # Scanner fallback step for axis that is not optimized for position-based predicates.
