@@ -852,45 +852,125 @@ module REXML
       case selector
       when :uniq
         seen = Set.new.compare_by_identity
-        recursive = ->(node) do
-          node_type = node.node_type
-          return if seen.include?(node)
-          seen << node if node_type != :xmldecl
-          return unless node_type == :element || node_type == :document
-          node.children.each do |child|
-            recursive.call(child)
-          end
-        end
+        new_nodeset = []
         nodeset.each do |node|
-          if include_self
-            recursive.call(node)
-          else
-            node.children.each(&recursive)
-          end
+          descendant_recursive(node, new_nodeset, seen, include_self)
         end
-        seen.select(&tester)
-      else
+        return new_nodeset.select(&tester)
+      when :nodesets
         nodesets = nodeset.map do |node|
           new_nodeset = []
-          new_nodes = {}
-          descendant_recursive(node, new_nodeset, new_nodes, include_self)
+          descendant_recursive(node, new_nodeset, nil, include_self)
           new_nodeset
         end
-        non_optimized_nodesets_select(nodesets, tester, selector)
+        return non_optimized_nodesets_select(nodesets, tester, selector)
+      end
+
+      targets = Set.new.compare_by_identity.replace(nodeset)
+      descendant_anchor_roots(nodeset).flat_map do |root|
+        descendant_positional_scan(root, targets, tester, selector, include_self)
       end
     end
 
-    def descendant_recursive(node, new_nodeset, new_nodes, include_self)
+    def descendant_positional_scan(root, targets, tester, selector, include_self)
+      events = []
+      descendant_traverse(root) do |type, node|
+        if type == :enter
+          if include_self
+            events << :enter if targets.include?(node)
+            events << node if tester.call(node)
+          else
+            events << node if node != root && tester.call(node)
+            events << :enter if targets.include?(node)
+          end
+        elsif type == :leave
+          events << :leave if targets.include?(node)
+        end
+      end
+      operator, value = selector
+      reverse = operator == :reverse_index_eq || operator == :reverse_index_lt || operator == :reverse_index_gt
+      events.reverse! if reverse
+      start_event = reverse ? :leave : :enter
+      end_event = reverse ? :enter : :leave
+      anchor_indexes = []
+      anchor_set = Set[]
+      node_index = 0
+      result = []
+      events.each do |event|
+        if event == start_event
+          anchor_indexes << node_index
+          anchor_set << node_index
+        elsif event == end_event
+          idx = anchor_indexes.pop
+          anchor_set.delete(idx) if anchor_indexes.last != idx
+        else # event is a node that passed the tester
+          case operator
+          when :index_eq, :reverse_index_eq
+            result << event if anchor_set.include?(node_index - value)
+          when :index_lt, :reverse_index_gt
+            result << event if node_index - anchor_indexes.last < value
+          when :index_gt, :reverse_index_lt
+            result << event if node_index > value
+          end
+          node_index += 1
+        end
+      end
+      result
+    end
+
+    def descendant_traverse(node, &block)
+      yield :enter, node
+      node_type = node.node_type
+      if node_type == :element or node_type == :document
+        node.children.each do |child|
+          descendant_traverse(child, &block) if child.node_type != :xmldecl
+        end
+      end
+      yield :leave, node
+    end
+
+    def descendant_anchor_roots(nodes)
+      targets = Set.new.compare_by_identity.replace(nodes)
+      no_root_seen = Set.new.compare_by_identity
+      seen = Set.new.compare_by_identity
+      roots = []
+      nodes.each do |node|
+        start_node = node
+        while node
+          if no_root_seen.include?(node)
+            break
+          elsif seen.include?(node)
+            root = nil
+            break
+          elsif targets.include?(node)
+            root = node
+          end
+          seen << node
+          node = node.parent
+        end
+        if root
+          roots << root
+          node = root.parent
+          while node && !no_root_seen.include?(node)
+            no_root_seen << node
+            node = node.parent
+          end
+        end
+      end
+      roots
+    end
+
+    def descendant_recursive(node, new_nodeset, seen, include_self)
       if include_self
-        return if new_nodes.key?(node)
+        return if seen&.include?(node)
         new_nodeset << node
-        new_nodes[node] = true
+        seen&.<< node
       end
 
       node_type = node.node_type
       if node_type == :element or node_type == :document
         node.children.each do |child|
-          descendant_recursive(child, new_nodeset, new_nodes, true)
+          descendant_recursive(child, new_nodeset, seen, true) if child.node_type != :xmldecl
         end
       end
     end
