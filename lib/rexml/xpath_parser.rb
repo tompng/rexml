@@ -477,60 +477,6 @@ module REXML
           children = children.reverse if reverse
           children.drop_while {|child| !sets.include?(child) }.drop(1)
         end.select(&tester)
-      when :index_eq, :index_lt, :index_gt
-        nodeset.group_by(&:parent).flat_map do |parent, sibling_nodes|
-          anchors = Set.new.compare_by_identity
-          sibling_nodes.each {|sibling| anchors << sibling }
-          children = parent.children
-          children = children.reverse if reverse
-          followings = children.drop_while {|child| !anchors.include?(child) }.drop(1)
-          anchor_indexes = Set[0]
-          last_anchor = 0
-          index = 0
-          matched = []
-          followings.each do |node|
-            if tester.call(node)
-              case operator
-              when :index_eq
-                # anchor_indexes only contain values smaller or equal to `index`,
-                # so value < 0 case doesn't accidentally match any node.
-                matched << node if anchor_indexes.include?(index - value)
-              when :index_lt
-                # Position from the last anchor will be the minimum possible position for the node
-                matched << node if index - last_anchor < value
-              when :index_gt
-                # Position from the first anchor(==0) will be the maximum possible position for the node
-                matched << node if index > value
-              end
-              index += 1
-            end
-            if anchors.include?(node)
-              anchor_indexes << index
-              last_anchor = index
-            end
-          end
-          matched
-        end
-      when :reverse_index_eq, :reverse_index_lt, :reverse_index_gt
-        nodeset.group_by(&:parent).flat_map do |parent, sibling_nodes|
-          anchors = Set.new.compare_by_identity
-          sibling_nodes.each {|sibling| anchors << sibling }
-          children = parent.children
-          children = children.reverse if reverse
-
-          # Different anchor node gives the same reverse-index. We only need to check with the first anchor
-          followings = children.drop_while {|child| !anchors.include?(child) }.drop(1)
-          candidates = followings.select(&tester).reverse
-          case operator
-          when :reverse_index_eq
-            matched = candidates[value] if value >= 0
-            matched ? [matched] : []
-          when :reverse_index_lt
-            value >= 0 ? candidates[0...value] : []
-          when :reverse_index_gt
-            value >= 0 ? candidates.drop(value + 1) : candidates
-          end
-        end
       when :nodesets
         nodesets = nodeset.map do |node|
           parent = node.parent
@@ -538,6 +484,20 @@ module REXML
           reverse ? parent.children[0...index].reverse : parent.children[index + 1..-1]
         end
         non_optimized_nodesets_select(nodesets, tester, selector)
+      else
+        nodeset.group_by(&:parent).flat_map do |parent, sibling_nodes|
+          anchors = Set.new.compare_by_identity.replace(sibling_nodes)
+          children = parent.children
+          children = children.reverse if reverse
+          followings = children.drop_while {|child| !anchors.include?(child) }.drop(1)
+          events = [:push]
+          followings.each do |node|
+            events << node if tester.call(node)
+            events << :push if anchors.include?(node)
+          end
+          anchors.size.times { events << :pop }
+          sequence_positional_scan(events, selector)
+        end
       end
     end
 
@@ -877,23 +837,30 @@ module REXML
       descendant_traverse(root) do |type, node|
         if type == :enter
           if include_self
-            events << :enter if targets.include?(node)
+            events << :push if targets.include?(node)
             events << node if tester.call(node)
           else
             events << node if node != root && tester.call(node)
-            events << :enter if targets.include?(node)
+            events << :push if targets.include?(node)
           end
         elsif type == :leave
-          events << :leave if targets.include?(node)
+          events << :pop if targets.include?(node)
         end
       end
+      sequence_positional_scan(events, selector)
+    end
+
+    # Select nodes matching the positional predicate from a sequence of events.
+    # Events are: :push, :pop, and node
+    # push/pop is an event that pushes/pops an anchor of position-based predicate
+    def sequence_positional_scan(events, selector)
       operator, value = selector
       reverse = operator == :reverse_index_eq || operator == :reverse_index_lt || operator == :reverse_index_gt
-      events.reverse! if reverse
-      start_event = reverse ? :leave : :enter
-      end_event = reverse ? :enter : :leave
+      events = events.reverse_each if reverse
+      start_event = reverse ? :pop : :push
+      end_event = reverse ? :push : :pop
       anchor_indexes = []
-      anchor_set = Set[]
+      anchor_set = Set.new
       node_index = 0
       result = []
       events.each do |event|
@@ -907,9 +874,9 @@ module REXML
           case operator
           when :index_eq, :reverse_index_eq
             result << event if anchor_set.include?(node_index - value)
-          when :index_lt, :reverse_index_gt
+          when :index_lt, :reverse_index_lt
             result << event if node_index - anchor_indexes.last < value
-          when :index_gt, :reverse_index_lt
+          when :index_gt, :reverse_index_gt
             result << event if node_index > value
           end
           node_index += 1
@@ -1023,36 +990,32 @@ module REXML
 
     # Scanner for following axis
     def following(nodeset, tester, selector)
-      nodesets = nodeset.select {|node| node.respond_to?(:parent) }.map do |node|
-        following_nodes(node)
+      anchors = Set.new.compare_by_identity.replace(nodeset)
+      events = []
+      descendant_traverse(nodeset.first.document || nodeset.first.root) do |type, node|
+        events << :push if type == :leave && anchors.include?(node)
+        events << node if !events.empty? && type == :enter && tester.call(node)
       end
-      non_optimized_nodesets_select(nodesets, tester, selector)
-    end
-
-    def following_nodes(node)
-      followings = []
-      following_node = next_sibling_node(node)
-      while following_node
-        followings << following_node
-        following_node = following_node_of(following_node)
+      anchors.size.times { events << :pop }
+      case selector
+      when :uniq
+        events.grep_v(Symbol)
+      when :nodesets
+        indexes = []
+        nodes = []
+        events.each do |e|
+          if e == :push
+            indexes << nodes.size
+          elsif e != :pop
+            nodes << e
+          end
+        end
+        indexes.map do |index|
+          nodes[index..-1]
+        end
+      else
+        sequence_positional_scan(events, selector)
       end
-      followings
-    end
-
-    def following_node_of( node )
-      return node.children[0] if node.kind_of?(Element) and node.children.size > 0
-
-      next_sibling_node(node)
-    end
-
-    def next_sibling_node(node)
-      psn = node.next_sibling_node
-      while psn.nil?
-        return nil if node.parent.nil? or node.parent.class == Document
-        node = node.parent
-        psn = node.next_sibling_node
-      end
-      psn
     end
 
     def child(nodeset)
