@@ -883,13 +883,23 @@ module REXML
         seen = Set.new.compare_by_identity
         new_nodeset = []
         nodeset.each do |node|
-          descendant_recursive(node, new_nodeset, seen, include_self)
+          descendant_traverse(node) do |n|
+            if seen.include?(n)
+              false
+            else
+              seen << n if include_self || !n.equal?(node)
+              true
+            end
+          end
         end
-        return new_nodeset.select(&tester)
+        return seen.to_a.select(&tester)
       when :nodesets
         nodesets = nodeset.map do |node|
           new_nodeset = []
-          descendant_recursive(node, new_nodeset, nil, include_self)
+          descendant_traverse(node) do |n|
+            new_nodeset << n if include_self || !n.equal?(node)
+            true
+          end
           new_nodeset
         end
         return non_optimized_nodesets_select(nodesets, tester, selector)
@@ -903,13 +913,13 @@ module REXML
 
     def descendant_positional_scan(root, targets, tester, selector, include_self)
       events = []
-      descendant_traverse(root) do |type, node|
+      descendant_traverse_event(root) do |type, node|
         if type == :enter
           if include_self
             events << :push if targets.include?(node)
             events << node if tester.call(node)
           else
-            events << node if node != root && tester.call(node)
+            events << node if !node.equal?(root) && tester.call(node)
             events << :push if targets.include?(node)
           end
         elsif type == :leave
@@ -954,61 +964,61 @@ module REXML
       result
     end
 
-    def descendant_traverse(node, &block)
-      yield :enter, node
-      node_type = node.node_type
-      if node_type == :element or node_type == :document
-        node.children.each do |child|
-          descendant_traverse(child, &block) if child.node_type != :xmldecl
+    # Scans the descendants of a node in document order,
+    # yielding :enter and :leave events for each node.
+    def descendant_traverse_event(node)
+      stack = [node]
+      until stack.empty?
+        if stack.last
+          node = stack.last
+          # Push nil as a mark that we are entering this node.
+          # If we see this mark again, we know to pop the node and yield :leave
+          stack << nil
+          yield :enter, node
+          node_type = node.node_type
+          if node_type == :element or node_type == :document
+            node.children.reverse_each do |child|
+              stack << child if child.node_type != :xmldecl
+            end
+          end
+        else
+          stack.pop
+          node = stack.pop
+          yield :leave, node
         end
       end
-      yield :leave, node
+    end
+
+    # Scans the descendants of a node in document order.
+    # If a block returns falsy value, the node's descendants are not traversed.
+    def descendant_traverse(node)
+      stack = [node]
+      until stack.empty?
+        node = stack.pop
+        next unless yield node
+
+        node_type = node.node_type
+        if node_type == :element or node_type == :document
+          node.children.reverse_each do |child|
+            stack << child if child.node_type != :xmldecl
+          end
+        end
+      end
     end
 
     def descendant_anchor_roots(nodes)
-      targets = Set.new.compare_by_identity.replace(nodes)
-      no_root_seen = Set.new.compare_by_identity
       seen = Set.new.compare_by_identity
-      roots = []
       nodes.each do |node|
-        start_node = node
-        while node
-          if no_root_seen.include?(node)
-            break
-          elsif seen.include?(node)
-            root = nil
-            break
-          elsif targets.include?(node)
-            root = node
-          end
-          seen << node
-          node = node.parent
-        end
-        if root
-          roots << root
-          node = root.parent
-          while node && !no_root_seen.include?(node)
-            no_root_seen << node
-            node = node.parent
+        descendant_traverse(node) do |n|
+          if seen.include?(n)
+            false
+          else
+            seen << n unless n.equal?(node)
+            true
           end
         end
       end
-      roots
-    end
-
-    def descendant_recursive(node, new_nodeset, seen, include_self)
-      if include_self
-        return if seen&.include?(node)
-        new_nodeset << node
-        seen&.<< node
-      end
-
-      node_type = node.node_type
-      if node_type == :element or node_type == :document
-        node.children.each do |child|
-          descendant_recursive(child, new_nodeset, seen, true) if child.node_type != :xmldecl
-        end
-      end
+      nodes.reject {|node| seen.include?(node) }
     end
 
     # Scanner for preceding axis
@@ -1017,7 +1027,7 @@ module REXML
         rejects = []
         nodes = []
         unreached = Set.new.compare_by_identity.replace(nodeset)
-        descendant_traverse(nodeset.first.document || nodeset.first.root) do |type, node|
+        descendant_traverse_event(nodeset.first.document || nodeset.first.root) do |type, node|
           case type
           when :enter
             unreached.delete(node)
@@ -1043,7 +1053,7 @@ module REXML
     def preceding_nodes(anchor)
       ancestors = []
       nodes = []
-      descendant_traverse(anchor.document || anchor.root) do |type, node|
+      descendant_traverse_event(anchor.document || anchor.root) do |type, node|
         if type == :enter
           break if node.equal?(anchor)
           nodes << node
@@ -1060,7 +1070,7 @@ module REXML
     def following(nodeset, tester, selector)
       anchors = Set.new.compare_by_identity.replace(nodeset)
       events = []
-      descendant_traverse(nodeset.first.document || nodeset.first.root) do |type, node|
+      descendant_traverse_event(nodeset.first.document || nodeset.first.root) do |type, node|
         events << :push if type == :leave && anchors.include?(node)
         events << node if !events.empty? && type == :enter && tester.call(node)
       end
