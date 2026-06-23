@@ -944,48 +944,47 @@ module REXML
 
     # Scanner for preceding axis
     def preceding(nodeset, tester, selector)
-      nodesets = nodeset.select {|node| node.respond_to?(:parent) }.map {|node| preceding_nodes(node) }
-      non_optimized_nodesets_select(nodesets, tester, selector)
+      if selector == :uniq
+        rejects = []
+        nodes = []
+        unreached = Set.new.compare_by_identity.replace(nodeset)
+        descendant_traverse(nodeset.first.document || nodeset.first.root) do |type, node|
+          case type
+          when :enter
+            unreached.delete(node)
+            break if unreached.empty?
+            nodes << node if tester.call(node)
+            rejects << node
+          when :leave
+            rejects.pop
+          end
+        end
+        rejects = Set.new.compare_by_identity.replace(rejects)
+        nodes.reject {|node| rejects.include?(node) }
+      else
+        nodesets = nodeset.map {|node| preceding_nodes(node) }
+        non_optimized_nodesets_select(nodesets, tester, selector)
+      end
     end
 
     # Builds a nodeset of all of the preceding nodes of the supplied node,
     # in reverse document order
     # preceding:: includes every element in the document that precedes this node,
     # except for ancestors
-    def preceding_nodes(node)
+    def preceding_nodes(anchor)
       ancestors = []
-      parent = node.parent
-      while parent
-        ancestors << parent
-        parent = parent.parent
-      end
-
-      precedings = []
-      preceding_node = preceding_node_of(node)
-      while preceding_node
-        if ancestors.include?(preceding_node)
-          ancestors.delete(preceding_node)
-        else
-          precedings << preceding_node
+      nodes = []
+      descendant_traverse(anchor.document || anchor.root) do |type, node|
+        if type == :enter
+          break if node.equal?(anchor)
+          nodes << node
+          ancestors << node
+        elsif type == :leave
+          ancestors.pop
         end
-        preceding_node = preceding_node_of(preceding_node)
       end
-      precedings
-    end
-
-    def preceding_node_of( node )
-      psn = node.previous_sibling_node
-      if psn.nil?
-        if node.parent.nil? or node.parent.class == Document
-          return nil
-        end
-        return node.parent
-        #psn = preceding_node_of( node.parent )
-      end
-      while psn and psn.kind_of? Element and psn.children.size > 0
-        psn = psn.children[-1]
-      end
-      psn
+      ancestors = Set.new.compare_by_identity.replace(ancestors)
+      nodes.reject {|node| ancestors.include?(node) }.reverse
     end
 
     # Scanner for following axis
