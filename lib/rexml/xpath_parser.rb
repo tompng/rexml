@@ -804,68 +804,98 @@ module REXML
       trace(:leave, tag, *args)
     end
 
-    # Sorts before any real child index, so that the attributes of an element
-    # come after the element itself but before its children.
-    ATTRIBUTE_POSITION = -1
-    private_constant :ATTRIBUTE_POSITION
-
-    # Reorders an array of nodes so that they are in document order
-    # It tries to do this efficiently.
+    # Reorders an array of nodes so that they are in document order.
     #
-    # FIXME: I need to get rid of this, but the issue is that most of the XPath
-    # interpreter functions as a filter, which means that we lose context going
-    # in and out of function calls.  If I knew what the index of the nodes was,
-    # I wouldn't have to do this.  Maybe add a document IDX for each node?
-    # Problems with mutable documents.  Or, rewrite everything.
+    # Builds the reduced tree spanning the nodes -- each node's walk toward
+    # the root, cut off where it merges into another walk -- and reads the
+    # nodes back off with a depth-first traversal, which meets them in
+    # document order.  Nothing above the nodes' common ancestor is visited.
+    #
+    # The input must not contain the same node twice; an XPath node-set
+    # never does, and the result for one that does is unspecified.
     def self.sort(array_of_nodes)
       return array_of_nodes if array_of_nodes.size <= 1
+      nodeset = Set.new.compare_by_identity.replace(array_of_nodes)
+      has_attribute = Set.new.compare_by_identity
+      node_children = {}.compare_by_identity
 
-      attribute_positions = {}.compare_by_identity
-      array_of_nodes.sort_by do |node|
+      # Each attribute is folded onto its owner element: an attribute has no
+      # place of its own in the child tree, so it is ordered by its element
+      # and emitted right after it.
+      roots = Set.new.compare_by_identity
+      array_of_nodes.each do |node|
         if node.node_type == :attribute
-          # An attribute has no place of its own in the child tree, so its key
-          # extends that of the element carrying it.
-          ancestor_indexes(node.element) <<
-            ATTRIBUTE_POSITION << attribute_position(node, attribute_positions)
+          element = node.element
+          has_attribute << element
         else
-          ancestor_indexes(node)
+          element = node
+        end
+        roots << element
+      end
+
+      # The nodes themselves count as visited: one can be an ancestor of
+      # another, and the walk that reaches it must merge there, not climb it
+      # a second time.
+      visited_roots = roots.dup
+      document_roots = Set.new.compare_by_identity
+
+      # Walk up from all roots in lockstep, linking each visited node under
+      # its parent.  A walk ends by merging into a visited node or at a
+      # parentless root.  Walks only ever vanish by merging, so a sole
+      # surviving walk stands at a common ancestor of every node, and the
+      # climb can stop there, well below the top of a large document.  The
+      # early stop is sound only while no walk has ended at a parentless
+      # root: after that, the survivor has to keep climbing until it merges,
+      # or its subtree would be traversed beside that root's tree instead of
+      # inside it.
+      until roots.empty? || (roots.size == 1 && document_roots.empty?)
+        next_roots = Set.new.compare_by_identity
+        roots.each do |root|
+          parent = root.parent
+          if parent
+            node_children[parent] ||= Set.new.compare_by_identity
+            node_children[parent] << root
+            unless visited_roots.include?(parent)
+              visited_roots << parent
+              next_roots << parent
+            end
+          else
+            document_roots << root
+          end
+        end
+        roots = next_roots
+      end
+
+      # Depth-first traversal of the reduced tree, emitting nodes in document
+      # order: each node, then its attributes, then its children.
+      sorted = []
+      stack = (document_roots + roots).to_a.reverse
+      until stack.empty?
+        node = stack.pop
+        if nodeset.include?(node)
+          sorted << node
+        end
+
+        if has_attribute.include?(node)
+          node.attributes.each_attribute do |attribute|
+            sorted << attribute if nodeset.include?(attribute)
+          end
+        end
+
+        if (children = node_children[node])
+          if children.size == 1
+            stack << children.first
+          else
+            node.children.reverse_each do |child|
+              if children.include?(child)
+                stack << child
+              end
+            end
+          end
         end
       end
+      sorted
     end
-
-    # The index the node holds under each of its ancestors, outermost first.
-    def self.ancestor_indexes(node)
-      indexes = []
-      # Walk all the way up to the document.  Stopping at the root element
-      # would leave every node outside it, and the root itself, with the same
-      # empty key, and ties are then broken arbitrarily.
-      while (parent = node.parent)
-        indexes << parent.index(node)
-        node = parent
-      end
-      indexes.reverse!
-    end
-    private_class_method :ancestor_indexes
-
-    # Where the attribute sits among the attributes of its element.  XPath 1.0
-    # leaves the relative order of those implementation dependent, but document
-    # order is a total ordering, so they do need one; this keeps them in the
-    # order they were written in.
-    def self.attribute_position(attribute, positions)
-      position = positions[attribute]
-      return position if position
-
-      # Index the whole attribute list at once.  A node set often holds every
-      # attribute of an element, and looking each one up on its own would make
-      # sorting quadratic in the number of attributes.
-      i = 0
-      attribute.element.attributes.each_attribute do |other|
-        positions[other] ||= i
-        i += 1
-      end
-      positions[attribute]
-    end
-    private_class_method :attribute_position
 
     # Scanner for descendant-or-self axis
     def descendant_or_self(nodeset, tester, selector)
